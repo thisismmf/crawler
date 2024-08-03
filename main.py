@@ -1,168 +1,151 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
 import tweepy
+from typing import List, Optional
 
+# Initialize FastAPI app
 app = FastAPI()
 
-# Declare client as a global variable
-client = None
 
-
-# Models for request and response
+# Pydantic models for request bodies
 class AuthInfo(BaseModel):
-    api_key: str
-    api_key_secret: str
-    access_token: str
-    access_token_secret: str
+    bearer_token: str
 
 
 class ProxyConfig(BaseModel):
-    proxies: List[str]
+    proxies: Optional[List[str]]
 
 
-class UserSearchResponse(BaseModel):
-    tweet_text: str
-    time_of_tweet: str
-    number_of_likes: int
-    number_of_retweets: int
-    type_of_tweet: str
-    hashtags: List[str]
-    mentions: List[str]
-    links: List[str]
-    username: str
-    user_id: int
-    geo: Optional[str]
-    tweet_link: str
+class UserSearchRequest(BaseModel):
+    usernames: List[str]
 
 
-class KeywordSearchResponse(UserSearchResponse):
-    keyword: str
+class KeywordSearchRequest(BaseModel):
+    keywords: List[str]
 
 
-# Helper function to determine tweet type
-def get_tweet_type(tweet):
-    if hasattr(tweet, "retweeted_status"):
-        return "retweet"
-    elif hasattr(tweet, "quoted_status"):
-        return "quote"
-    elif tweet.in_reply_to_status_id is not None:
-        return "reply"
+# Global variables to store auth and proxy config
+bearer_token = None
+proxies = None
+
+
+def create_twitter_client():
+    if bearer_token is None:
+        raise HTTPException(status_code=400, detail="Twitter authentication not configured.")
+
+    # Set up the API client for Twitter API v2
+    client = tweepy.Client(bearer_token=bearer_token)
+
+    return client
+
+
+# Endpoint for account management
+@app.post("/account_manage")
+async def account_manage(auth_info: AuthInfo):
+    global bearer_token
+    bearer_token = auth_info.bearer_token
+    return {"message": "Authentication information updated successfully."}
+
+
+# Endpoint for proxy configuration
+@app.post("/proxy_config")
+async def proxy_config(proxy_config: ProxyConfig):
+    global proxies
+    proxies = proxy_config.proxies
+    return {"message": "Proxy configuration updated successfully.", "proxies": proxies}
+
+
+# Endpoint for user search
+@app.post("/users_search")
+async def users_search(user_search_request: UserSearchRequest):
+    client = create_twitter_client()
+
+    results = []
+    for username in user_search_request.usernames:
+        try:
+            user = client.get_user(username=username)
+            user_id = user.data.id
+            tweets = client.get_users_tweets(id=user_id, max_results=10)
+
+            for tweet in tweets.data:
+                tweet_details = client.get_tweet(tweet.id, expansions=["author_id", "entities"])
+                tweet_info = tweet_details.data
+                entities = tweet_info.get('entities', {})
+
+                results.append({
+                    "tweet_text": tweet_info.text,
+                    "time_of_tweet": tweet_info.created_at,
+                    "likes": tweet_info.public_metrics["like_count"],
+                    "retweets": tweet_info.public_metrics["retweet_count"],
+                    "tweet_type": determine_tweet_type(tweet_info),
+                    "hashtags": [hashtag["tag"] for hashtag in entities.get("hashtags", [])],
+                    "mentions": [mention["username"] for mention in entities.get("mentions", [])],
+                    "links": [url["expanded_url"] for url in entities.get("urls", [])],
+                    "username": username,
+                    "user_id": user_id,
+                    "geo": tweet_info.geo,
+                    "tweet_link": f"https://twitter.com/{username}/status/{tweet.id}"
+                })
+        except tweepy.errors.Forbidden as e:
+            raise HTTPException(status_code=403, detail=f"Access forbidden: {str(e)}")
+        except tweepy.errors.TweepyException as e:
+            raise HTTPException(status_code=400, detail=f"Error fetching tweets for {username}: {str(e)}")
+
+    return results
+
+
+# Endpoint for keyword search
+@app.post("/keywords_search")
+async def keywords_search(keyword_search_request: KeywordSearchRequest):
+    client = create_twitter_client()
+
+    results = []
+    for keyword in keyword_search_request.keywords:
+        try:
+            tweets = client.search_recent_tweets(query=keyword, max_results=10)
+
+            for tweet in tweets.data:
+                tweet_details = client.get_tweet(tweet.id, expansions=["author_id", "entities"])
+                tweet_info = tweet_details.data
+                entities = tweet_info.get('entities', {})
+
+                results.append({
+                    "tweet_text": tweet_info.text,
+                    "time_of_tweet": tweet_info.created_at,
+                    "likes": tweet_info.public_metrics["like_count"],
+                    "retweets": tweet_info.public_metrics["retweet_count"],
+                    "tweet_type": determine_tweet_type(tweet_info),
+                    "hashtags": [hashtag["tag"] for hashtag in entities.get("hashtags", [])],
+                    "mentions": [mention["username"] for mention in entities.get("mentions", [])],
+                    "links": [url["expanded_url"] for url in entities.get("urls", [])],
+                    "username": tweet_info.author_id,
+                    "user_id": tweet_info.author_id,
+                    "geo": tweet_info.geo,
+                    "tweet_link": f"https://twitter.com/i/web/status/{tweet.id}"
+                })
+        except tweepy.errors.Forbidden as e:
+            raise HTTPException(status_code=403, detail=f"Access forbidden: {str(e)}")
+        except tweepy.errors.TweepyException as e:
+            raise HTTPException(status_code=400, detail=f"Error fetching tweets for keyword '{keyword}': {str(e)}")
+
+    return results
+
+
+# Utility function to determine tweet type
+def determine_tweet_type(tweet):
+    if 'referenced_tweets' in tweet:
+        referenced_type = tweet['referenced_tweets'][0]['type']
+        if referenced_type == 'retweeted':
+            return "retweet"
+        elif referenced_type == 'quoted':
+            return "quote"
+        elif tweet.in_reply_to_user_id is not None:
+            return "reply"
     return "tweet"
 
 
-@app.post("/account_manage")
-def account_manage(auth_info: AuthInfo):
-    try:
-        global client
-        client = tweepy.Client(
-            consumer_key=auth_info.api_key,
-            consumer_secret=auth_info.api_key_secret,
-            access_token=auth_info.access_token,
-            access_token_secret=auth_info.access_token_secret,
-            bearer_token="AAAAAAAAAAAAAAAAAAAAAGusvAEAAAAA2ETup9C7Eptf%2FFqevHl3pkCGc%2B4%3DwAdtRaN9eQcBkvJcmpcGGC0Ryy12mUmgmmZP2vPySjktEmbRr1"
-        )
-        return {"message": "Authentication successful"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Authentication failed: {str(e)}")
+# Example usage
+if __name__ == "__main__":
+    import uvicorn
 
-
-@app.post("/proxy_config")
-def proxy_config(proxy_config: ProxyConfig):
-    global proxies
-    proxies = proxy_config.proxies
-    return {"message": "Proxy configuration updated successfully"}
-
-
-@app.get("/users_search", response_model=List[UserSearchResponse])
-def users_search(usernames: List[str] = Query(...)):
-    if client is None:
-        raise HTTPException(status_code=401,
-                            detail="Authentication required. Please authenticate using /account_manage first.")
-
-    results = []
-    try:
-        for username in usernames:
-            # Use Twitter API v2 client method to get user by username
-            response = client.get_user(username=username, user_fields=['id', 'name', 'username'])
-            if response.data is None:
-                raise HTTPException(status_code=404, detail=f"User '{username}' not found.")
-
-            user_id = response.data.id
-            # Get tweets from user
-            tweets_response = client.get_users_tweets(id=user_id, max_results=10,
-                                                      tweet_fields=['created_at', 'public_metrics', 'geo', 'entities'])
-
-            if not tweets_response.data:
-                continue
-
-            for tweet in tweets_response.data:
-                public_metrics = tweet.public_metrics
-                tweet_type = get_tweet_type(tweet)
-                hashtags = [hashtag['tag'] for hashtag in tweet.entities.get('hashtags', [])]
-                mentions = [mention['username'] for mention in tweet.entities.get('mentions', [])]
-                links = [url['expanded_url'] for url in tweet.entities.get('urls', [])]
-                geo = tweet.geo.get('place_id') if tweet.geo else None
-
-                results.append(UserSearchResponse(
-                    tweet_text=tweet.text,
-                    time_of_tweet=str(tweet.created_at),
-                    number_of_likes=public_metrics.get('like_count', 0),
-                    number_of_retweets=public_metrics.get('retweet_count', 0),
-                    type_of_tweet=tweet_type,
-                    hashtags=hashtags,
-                    mentions=mentions,
-                    links=links,
-                    username=username,
-                    user_id=user_id,
-                    geo=geo,
-                    tweet_link=f"https://twitter.com/{username}/status/{tweet.id}"
-                ))
-    except tweepy.TweepyException as e:
-        raise HTTPException(status_code=400, detail=f"Error retrieving tweets: {str(e)}")
-    return results
-
-
-@app.get("/keywords_search", response_model=List[KeywordSearchResponse])
-def keywords_search(keywords: List[str] = Query(...)):
-    if client is None:
-        raise HTTPException(status_code=401,
-                            detail="Authentication required. Please authenticate using /account_manage first.")
-
-    results = []
-    try:
-        for keyword in keywords:
-            # Use Twitter API v2 client method to search recent tweets
-            search_response = client.search_recent_tweets(query=keyword, max_results=10,
-                                                          tweet_fields=['created_at', 'public_metrics', 'geo',
-                                                                        'entities'])
-
-            if not search_response.data:
-                continue
-
-            for tweet in search_response.data:
-                public_metrics = tweet.public_metrics
-                tweet_type = get_tweet_type(tweet)
-                hashtags = [hashtag['tag'] for hashtag in tweet.entities.get('hashtags', [])]
-                mentions = [mention['username'] for mention in tweet.entities.get('mentions', [])]
-                links = [url['expanded_url'] for url in tweet.entities.get('urls', [])]
-                geo = tweet.geo.get('place_id') if tweet.geo else None
-
-                results.append(KeywordSearchResponse(
-                    tweet_text=tweet.text,
-                    time_of_tweet=str(tweet.created_at),
-                    number_of_likes=public_metrics.get('like_count', 0),
-                    number_of_retweets=public_metrics.get('retweet_count', 0),
-                    type_of_tweet=tweet_type,
-                    hashtags=hashtags,
-                    mentions=mentions,
-                    links=links,
-                    username=tweet.author.username,
-                    user_id=tweet.author.id,
-                    geo=geo,
-                    tweet_link=f"https://twitter.com/{tweet.author.username}/status/{tweet.id}",
-                    keyword=keyword
-                ))
-    except tweepy.TweepyException as e:
-        raise HTTPException(status_code=400, detail=f"Error retrieving tweets: {str(e)}")
-    return results
+    uvicorn.run(app, host="127.0.0.1", port=8000)
